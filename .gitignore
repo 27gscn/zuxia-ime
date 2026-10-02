@@ -1,0 +1,47 @@
+/build/
+/dist/
+__pycache__/
+*.py[cod]
+.vs/
+/tools/*.exe
+/tools/rime.dll
+
+# 安装包构建产物（installer/setup/make-setup.ps1 生成）
+/installer/setup/payload.cab
+/installer/setup/payload.ddf
+/installer/setup/payload_info.h
+/installer/setup/setup.u16.rc
+/installer/setup/*.res
+/installer/setup/*.exe
+/installer/setup/obj_*/
+
+# 安装包不进 git。出货件由 CI 现编现打，包内带 BUILD-INFO.txt 自证是哪个提交，
+# 发在 Releases 页面上。以前 release/ 下放过一份 0.1.0 的成品，它装的是旧码位，
+# 三份文档都明令禁用，留着只会让人装错，已经删掉。
+/release/
+
+# 词组码表：42 万行 12 MB，由 data-tools/generate_phrases.py 现生成。
+# 进不了 git 也没必要 —— 它完全由 data-tools/sources/ 决定。
+/data/zuxia.extended.dict.yaml
+
+# 解码器数据：3.4 MB，由同一个生成器产出。
+/data/zuxia.decoder.tsv
+
+# 单字码表与候选注释表：0.3.0 起也不进 git。
+#
+# 原来是进的，理由写在 generate_phrases.py 的注释里 ——「单字表要留在 git 里
+# 逐行可审」。0.2.0 它是 66,505 行 1.0 MB，这话还算数。0.3.0 部件码放宽到三个、
+# 没有名称的部件再拆一层之后它是 275,268 行 4.4 MB，没有人会逐行审 4.4 MB，
+# 这个理由就不成立了。
+#
+# 它完全由 data-tools/sources/ 决定，CI 现生成现用，`audit_zuxia.py --regen`
+# 仍然跑两遍生成器逐字节比对，确定性这条性质没有丢。本地要看它，先跑
+# `python3 data-tools/generate_zuxia.py`。
+/data/zuxia.dict.yaml
+/data/zuxia_char_codes.dict.yaml
+
+# 拆字窗的数据：同样由 generate_zuxia.py 现生成（学习模式用）。
+/data/zuxia.parts.tsv
+
+# 方案网站的生成结果（site/build.py 输出）
+/site/dist/
