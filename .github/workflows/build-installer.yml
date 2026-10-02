@@ -1,0 +1,234 @@
+# 出 ZuxiaSetup-<版本>.exe。
+#
+# 这台开发机是 Linux，编译不了 MSVC；windows runner 自带 VS2022、CMake、
+# Windows SDK（rc.exe）、makecab 和 7-Zip，正好补上这一段。librime 由
+# scripts/fetch-librime.ps1 从官方 release 取，SHA-256 在脚本里钉死。
+#
+# 两个 job：先在 Linux 上验码表（快，失败就不用编了），再在 Windows 上
+# 编译、跑引擎断言、打包。产物在 Actions 页面的 Artifacts 里下载。
+name: build-installer
+
+on:
+  push:
+    branches: [main]
+    # 打 v* 标签会额外发一个 Release，见最后一步。
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  data:
+    name: 码表不变量
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      # 词组码表不进 git（42 万行 12 MB），这里生成一次当作冒烟测试：
+      # 生成器炸了，下面那个 job 编出来的安装包会是个哑巴输入法。
+      - name: generate_zuxia.py（单字表 0.3.0 起不进 git）
+        run: |
+          python data-tools/generate_zuxia.py
+          python data-tools/generate_codes.py
+
+      - name: generate_phrases.py
+        run: |
+          python data-tools/generate_phrases.py
+          python - <<'PY'
+          import pathlib
+          p = pathlib.Path("data/zuxia.extended.dict.yaml")
+          rows = sum(1 for line in p.open(encoding="utf-8") if "\t" in line)
+          print(f"{rows} 行, {p.stat().st_size} 字节")
+          assert rows > 300000, "词组码表行数不对"
+          PY
+
+      # --regen 会重跑两次生成器并逐字节比对。0.3.0 起单字表不进 git，所以
+      # 这一步验的是「生成器是确定的」，不再是「仓库里那份就是源码的产物」——
+      # 后面这条已经由「仓库里根本没有那份」自动成立。
+      - name: audit_zuxia.py --regen
+        run: python data-tools/audit_zuxia.py --regen
+
+      # 列式解码器：词库里没有的词也要能拼出来。15 条用例覆盖单字退化、
+      # 无部件字补位、结构位非法字母必须拒绝。
+      - name: decode_zuxia.py --selftest
+        run: python data-tools/decode_zuxia.py --selftest
+
+      # C++ 侧解码器自检：与上面 Python 自检同用例。用仓库自带的小 Win32
+      # 桩头在 Linux 上直接编 Decoder.cpp，53 条断言全过才放行。
+      - name: C++ 解码器自检（Linux）
+        run: |
+          g++ -std=c++17 -O2 -Itools/linux-selftest -Isrc \
+              -o /tmp/dselftest tools/linux-selftest/decoder-selftest.cpp src/Decoder.cpp
+          /tmp/dselftest
+
+      # dt（日期时间）、nl（农历）两个 Lua 脚本。农历逐日对 sxtwl（寿星天文历）
+      # 核对 1900–2100 年，日期时间在四个时区下核对；最后按 librime-lua 的调法
+      # 把两个翻译器跑一遍。历表 data/lua/zuxia_lunar_data.lua 进 git，这里用
+      # 生成器重算一遍逐字节比对，确认它就是 generate_lunar.py 的产物。
+      - name: Lua 脚本（dt 日期时间、nl 农历）
+        run: |
+          python -m pip install --disable-pip-version-check lupa==2.8 sxtwl==2.0.7
+          python data-tools/test_lua.py
+          python data-tools/generate_lunar.py --out "$RUNNER_TEMP/zuxia_lunar_data.lua"
+          cmp "$RUNNER_TEMP/zuxia_lunar_data.lua" data/lua/zuxia_lunar_data.lua
+
+      - name: 编码质量（留在日志里备查）
+        run: python data-tools/measure_zuxia.py data/zuxia.dict.yaml --labels "足下 $(cat VERSION)"
+
+  installer:
+    name: 编译与打包
+    needs: data
+    runs-on: windows-latest
+    # 只为最后那一步发 Release 用。GitHub 不支持按条件给权限，所以这个
+    # job 一直带着写权限 —— 这也是下面宁可用自带的 gh 命令、不引第三方
+    # action 的原因：能动仓库的东西越少越好。
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      # 必须在 build.ps1 之前：cmake --install 把 data\*.yaml 拷进
+      # dist\Zuxia\，安装包就是从那里打的。
+      - name: 生成词组码表
+        shell: pwsh
+        run: |
+          python data-tools/generate_zuxia.py
+          python data-tools/generate_codes.py
+          python data-tools/generate_phrases.py
+
+      - name: 读出版本号
+        id: ver
+        shell: pwsh
+        run: |
+          $v = (Get-Content VERSION -Raw).Trim()
+          "version=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "版本 $v"
+
+      # 仓库里已经带了 third_party/librime/*/dist/lib/rime.dll，脚本会跳过
+      # 下载；万一是浅克隆或将来把它从仓库里拿掉了，这一步兜住。
+      - name: 取 librime 1.17.0
+        shell: pwsh
+        run: pwsh scripts/fetch-librime.ps1
+
+      # 编译错误直接变成运行页面上的注解（文件、行号、错误码）。日志要登录才
+      # 看得到，注解不用。
+      - name: 注册 MSVC 错误匹配
+        shell: pwsh
+        run: Write-Output "::add-matcher::.github/msvc-problem-matcher.json"
+
+      - name: 编译 x64 + x86
+        shell: pwsh
+        run: pwsh scripts/build.ps1 -Arch all -Configuration Release
+
+      # engine-test 必须在 x64\ 目录里跑：RimeEngine 从自己的模块路径找
+      # rime.dll 和 ..\data，和文本服务运行时的行为一致。
+      # 断言输出要留一份到产物里。只有 pass/fail 是不够的：有几条断言会在
+      # 环境不满足时自己跳过（比如模拟 Shift 没起作用），光看「绿了」分不出
+      # 「跑过并通过」和「跳过了」—— 而那两件事的结论完全不同。
+      - name: 引擎断言
+        shell: pwsh
+        run: |
+          # engine-test 往管道里写的是 UTF-8；不设这一句，pwsh 按 OEM 代码页
+          # 解码，日志和注解里的中文就成了乱码。
+          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+          pwsh tools/build-engine-test.ps1 -Arch x64
+          Copy-Item tools/engine-test.exe dist/Zuxia/x64/ -Force
+          Push-Location dist/Zuxia/x64
+          .\engine-test.exe 2>&1 | Tee-Object -FilePath ../../engine-test.log
+          $code = $LASTEXITCODE
+          Pop-Location
+          # 测试程序绝不能留在暂存目录里 —— 下一步就是从这个目录打包，它会
+          # 跟着装进用户的 Program Files。日志同理，写到 dist\ 而不是暂存目录。
+          Remove-Item dist/Zuxia/x64/engine-test.exe -Force
+          if ($code -ne 0) { throw "engine-test 有断言没过" }
+
+      - name: 打单文件安装包
+        shell: pwsh
+        run: pwsh installer/setup/make-setup.ps1 -SkipBuild
+
+      # 这一步原先只是打印清单行数，对不对都放行。外部复审据此判定发布门禁
+      # 形同虚设，而且实际出过事：用户装到的 0.2.0 不是当时主分支编出来的。
+      # 现在每一条都是断言 —— 清单逐条重算、出货数据与 HEAD 逐字节比对、
+      # DLL 里必须有只有新代码才有的诊断串、载荷里不许夹带测试程序。
+      - name: 载荷门禁
+        shell: pwsh
+        run: pwsh scripts/audit-payload.ps1
+
+      - name: 上传安装包
+        uses: actions/upload-artifact@v4
+        with:
+          name: ZuxiaSetup-${{ steps.ver.outputs.version }}
+          path: |
+            dist/ZuxiaSetup-*.exe
+            dist/ZuxiaSetup-*.exe.sha256
+            dist/Zuxia/MANIFEST.sha256
+            dist/Zuxia/BUILD-INFO.txt
+            dist/engine-test.log
+          if-no-files-found: error
+          retention-days: 30
+
+      # 暂存目录本身也留一份：想手工核对某个 DLL 或用
+      # scripts/verify-install.ps1 逐文件比对时用得上。
+      - name: 上传暂存目录
+        uses: actions/upload-artifact@v4
+        with:
+          name: Zuxia-stage-${{ steps.ver.outputs.version }}
+          path: dist/Zuxia
+          if-no-files-found: error
+          retention-days: 7
+
+      # 上面那两份产物要登录 GitHub 才能下，而且 30 天后就没了。请人试用
+      # 得有个不用登录、不会过期的链接，所以打 v* 标签时顺手发一个 Release。
+      # 用 runner 自带的 gh，不引第三方 action。
+      - name: 发布 Release（仅 v* 标签）
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ZX_VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          $v = $env:ZX_VERSION
+          $tag = $env:GITHUB_REF_NAME
+          # 标签与 VERSION 原先从不比对。打错一个字（v0.2.1 而 VERSION 还是
+          # 0.2.0），发出去的 Release 标题、附件名和文件里的版本号就三样。
+          if ($tag -ne "v$v") {
+            throw "标签 $tag 与 VERSION ($v) 不一致。先改 VERSION 再打标签。"
+          }
+          $files = @(
+            "dist/ZuxiaSetup-$v.exe",
+            "dist/ZuxiaSetup-$v.exe.sha256",
+            "dist/Zuxia/MANIFEST.sha256",
+            "dist/Zuxia/BUILD-INFO.txt",
+            "dist/engine-test.log")
+          # 在网页上点「Publish release」会先把 Release 建好再推标签，这时候
+          # create 会撞车。两条路都得走得通，所以先看一眼有没有。
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            # 原先这里用 --clobber，等于「同名附件一律静默覆盖」。已经发出去
+            # 的哈希被悄悄换掉，是最坏的一种发布事故：别人算出来的校验值对不
+            # 上，而没有任何记录说明换过。所以有同名附件就停下来让人处理。
+            $existing = (gh release view $tag --json assets --jq '.assets[].name') -split "`n"
+            $clash = @($files | ForEach-Object { Split-Path $_ -Leaf } |
+                       Where-Object { $existing -contains $_ })
+            if ($clash.Count -gt 0) {
+              throw ("Release $tag 上已经有同名附件：" + ($clash -join ', ') +
+                     "。要重发请先删掉这些附件或换一个版本号。")
+            }
+            Write-Host "Release $tag 已存在，补挂产物"
+            gh release upload $tag @files
+            if ($LASTEXITCODE -ne 0) { throw "gh release upload 失败" }
+            gh release edit $tag --title "应物足下输入法 $v" --notes-file installer/RELEASE-NOTES.md
+            if ($LASTEXITCODE -ne 0) { throw "gh release edit 失败" }
+          } else {
+            gh release create $tag @files --title "应物足下输入法 $v" --notes-file installer/RELEASE-NOTES.md
+            if ($LASTEXITCODE -ne 0) { throw "gh release create 失败" }
+          }
