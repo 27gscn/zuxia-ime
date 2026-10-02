@@ -1,0 +1,131 @@
+# Rime schema
+# encoding: utf-8
+
+schema:
+  schema_id: zuxia
+  name: "应物音形足下输入方案"
+  version: "0.27"
+  author:
+    - "应物音形足下输入方案"
+  description: |
+    音形分工：全拼承担读音，结构与部件承担字形。
+    单字：全拼 → 加结构码 → 加一个部件码 → 加第二个 → 加第三个。
+    结构码 z 左右 / s 上下 / b 包围 / p 品字形及兜底 / d 独体，位置固定。
+    部件码取该部件「名称」的拼音首字母，氵取水(s)、宀取宝盖(b)。
+    部件名称以 GF 0014—2009《现代常用字部件及部件名称规范》为准，
+    一个部件可有多个通行叫法，多个码都认；没有名称的部件再往里拆一层。
+    任意一到三个部件均可，先后顺序不限。
+    不使用语言模型、用户学习或云端预测。
+    打 dt 出日期时间，打 nl 出农历。
+
+switches:
+  - name: ascii_mode
+    reset: 0
+    states: [中文, 西文]
+
+engine:
+  processors:
+    - ascii_composer
+    - recognizer
+    - speller
+    - punctuator
+    - selector
+    - navigator
+    - express_editor
+  segmentors:
+    - ascii_segmentor
+    - matcher
+    - abc_segmentor
+    - punct_segmentor
+    - fallback_segmentor
+  translators:
+    - punct_translator
+    - table_translator
+    # 两个 Lua 脚本在 data/lua/ 下，由 rime.dll 自带的 librime-lua 加载。
+    - lua_translator@*zuxia_datetime
+    - lua_translator@*zuxia_lunar
+  filters:
+    - uniquifier
+
+# 触发码：打 dt 出日期时间，打 nl 出农历；后面可以跟一个冒号（dt:、nl:）。
+# 两串都是足下码表里的死前缀（没有音节以 dt、nl 开头），不会挡住任何字词。
+# recognizer 让冒号能进组字串（冒号不在 alphabet 里，平时会被当成标点），
+# matcher 把整串认成一段交给上面两个 Lua 翻译器；只有整串正好是 dt、dt:、
+# nl、nl: 时才触发，打到一半的码里出现 dt 不受影响。
+recognizer:
+  patterns:
+    zuxia_datetime: "^dt:?$"
+    zuxia_lunar: "^nl:?$"
+
+# Shift tap switches between Chinese and Western input.
+#
+# 注意：下面这一段对足下是不生效的。中/西切换是在 TSF 层用 TF_MOD_ON_KEYUP
+# 预留键做的（src/KeyEventSink.cpp），Shift 和 Caps Lock 根本不会作为按键交
+# 给 librime，所以 ascii_composer 永远看不到它们。留着是为了直接拿 Rime 跑
+# 这份方案时行为一致 —— 改这里不会影响输入法里的 Shift 行为，别在这里找
+# 「打完标点变英文」那个毛病，它在 KeyEventSink.cpp。
+ascii_composer:
+  good_old_caps_lock: true
+  switch_key:
+    Shift_L: commit_code
+    Shift_R: commit_code
+    Control_L: noop
+    Control_R: noop
+    Caps_Lock: clear
+    Eisu_toggle: clear
+
+# Chinese text wants Chinese marks.
+punctuator:
+  half_shape:
+    ",": "，"
+    ".": "。"
+    ";": "；"
+    ":": "："
+    "?": "？"
+    "!": "！"
+    "\\": "、"
+    "<": "《"
+    ">": "》"
+    "(": "（"
+    ")": "）"
+    "[": "【"
+    "]": "】"
+    "{": "「"
+    "}": "」"
+    "'": { pair: ["'", "'"] }
+    '"': { pair: ["“", "”"] }
+    "^": "……"
+    "_": "——"
+    "~": "～"
+    "$": "￥"
+    "@": "＠"
+    "#": "＃"
+    "%": "％"
+    "&": "＆"
+    "*": "＊"
+    "+": "＋"
+    "-": "－"
+    "=": "＝"
+    "/": "／"
+    "|": "｜"
+    "`": "｀"
+
+speller:
+  alphabet: abcdefghijklmnopqrstuvwxyz
+  initials: abcdefghijklmnopqrstuvwxyz
+  delimiter: " '"
+  max_code_length: 96
+  auto_select: false
+
+translator:
+  # 单字表 zuxia.dict.yaml 被 zuxia.extended.dict.yaml import 进来。
+  dictionary: zuxia.extended
+  enable_charset_filter: true
+  enable_completion: true
+  enable_sentence: true
+  enable_user_dict: false
+  encode_commit_history: false
+  max_phrase_length: 12
+
+menu:
+  page_size: 9

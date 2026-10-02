@@ -1,0 +1,665 @@
+// Exercises the shipping RimeEngine against the 足下 scheme: candidate
+// annotation, reading selection for polyphonic characters, Chinese
+// punctuation and the Western-mode toggle.
+//
+// Must run from <root>\x64\ so RimeEngine finds rime.dll beside it and the
+// data directory at ..\data, exactly as the text service does:
+//
+//     build\engine-test-x64.bat        (or the command in tools\README.md)
+//     cd dist\Zuxia\x64
+//     ..\..\..\tools\engine-test.exe
+//
+// 单字、词组、以及词库里没有的词（由 src/Decoder.cpp 的列式解码器顶上）
+// 三类用例都在这里。解码器的数据是 data/zuxia.decoder.tsv —— 生成物，跑
+// python data-tools/generate_phrases.py 产出，由 cmake --install 拷进
+// dist\Zuxia\data，所以这个测试必须从 dist\Zuxia\x64 里跑。
+#include <windows.h>
+
+#include <cstdio>
+#include <cstring>
+#include <string>
+#include <vector>
+
+#include "RimeEngine.h"
+#include "Diagnostics.h"
+
+namespace {
+
+void Print(const std::wstring& text) {
+  if (text.empty()) return;
+  const int size = WideCharToMultiByte(CP_UTF8, 0, text.c_str(), -1, nullptr,
+                                       0, nullptr, nullptr);
+  if (size <= 0) return;
+  std::string buffer(static_cast<size_t>(size), '\0');
+  WideCharToMultiByte(CP_UTF8, 0, text.c_str(), -1, buffer.data(), size,
+                      nullptr, nullptr);
+  fputs(buffer.c_str(), stdout);
+}
+
+int failures = 0;
+int checks = 0;
+
+long long FileSize(const std::wstring& path) {
+  WIN32_FILE_ATTRIBUTE_DATA info = {};
+  if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &info)) {
+    return -1;  // not created yet, which is a legitimate starting point
+  }
+  return (static_cast<long long>(info.nFileSizeHigh) << 32) | info.nFileSizeLow;
+}
+
+void Case(zuxia::RimeEngine* engine, const char* keys, int show) {
+  engine->Clear();
+  zuxia::EngineSnapshot snapshot;
+  for (const char* p = keys; *p; ++p) {
+    snapshot = engine->ProcessKey(static_cast<int>(*p), 0);
+  }
+  printf("  %-12s -> ", keys);
+  const int total = static_cast<int>(snapshot.candidates.size());
+  const int n = total < show ? total : show;
+  for (int i = 0; i < n; ++i) {
+    const zuxia::Candidate& candidate = snapshot.candidates[i];
+    printf(" ");
+    Print(candidate.text);
+    if (!candidate.comment.empty()) {
+      printf("[");
+      Print(candidate.comment);
+      printf("]");
+    }
+  }
+  if (total == 0) printf(" (no candidates)");
+  printf("\n");
+}
+
+void Expect(const char* label, bool ok) {
+  ++checks;
+  printf("  %-52s %s\n", label, ok ? "PASS" : "FAIL");
+  if (!ok) {
+    ++failures;
+    // GitHub Actions 的工作流命令：失败的断言直接出现在运行页面的注解里，
+    // 不用翻日志。
+    printf("::error title=engine-test::%s\n", label);
+  }
+  fflush(stdout);
+}
+
+zuxia::EngineSnapshot Type(zuxia::RimeEngine* engine, const char* keys) {
+  engine->Clear();
+  zuxia::EngineSnapshot snapshot;
+  for (const char* p = keys; *p; ++p) {
+    snapshot = engine->ProcessKey(static_cast<int>(*p), 0);
+  }
+  return snapshot;
+}
+
+std::wstring Joined(const zuxia::EngineSnapshot& snapshot, size_t limit) {
+  std::wstring out;
+  for (size_t i = 0; i < snapshot.candidates.size() && i < limit; ++i) {
+    if (!out.empty()) out += L" | ";
+    out += snapshot.candidates[i].text;
+  }
+  return out.empty() ? L"(no candidates)" : out;
+}
+
+// 关键用例的候选也作为注解打出来：真机验收之前，在运行页面上就能看到
+// dt、nl、明月这几串码实际出了什么。
+void Notice(const char* keys, const zuxia::EngineSnapshot& snapshot) {
+  printf("::notice title=%s::", keys);
+  Print(Joined(snapshot, 9));
+  printf("\n");
+  fflush(stdout);
+}
+
+bool Contains(const std::wstring& text, const wchar_t* part) {
+  return text.find(part) != std::wstring::npos;
+}
+
+// 选中一个候选的两种合法结果：整串落下（commit 就是它）；或者它只吃掉前面
+// 几位码（Rime 的部分匹配，比如 zhongshu 对 zhongshushuzzd），那就不落字，组字串
+// 以它开头、剩下的码接着打。
+bool TookCandidate(const zuxia::EngineSnapshot& after, const std::wstring& want) {
+  if (after.commit == want) return true;
+  return after.commit.empty() && !want.empty() &&
+         after.preedit.compare(0, want.size(), want) == 0;
+}
+
+std::wstring CommentOf(zuxia::RimeEngine* engine, const char* keys,
+                       const wchar_t* want_text) {
+  engine->Clear();
+  zuxia::EngineSnapshot snapshot;
+  for (const char* p = keys; *p; ++p) {
+    snapshot = engine->ProcessKey(static_cast<int>(*p), 0);
+  }
+  for (const zuxia::Candidate& candidate : snapshot.candidates) {
+    if (candidate.text == want_text) return candidate.comment;
+  }
+  return L"(not found)";
+}
+
+// 注释里的码随部件别名表变化 —— 给 青 加一条「里面看得见月」，清 就从两个
+// 满码变成四个。所以断言不能钉死字面量，否则每加一条别名就要改一次测试，
+// 而它其实什么都没测出来。这里断言的是不随别名改变的两条性质：
+//
+//   1. 注释里的每个码都以已经打出的那几键开头 —— 承诺的码必须真的打得到。
+//      AnnotateCode 在这里出过 bug：`行` 在 hang 下会多出一个 `…`，指向一个
+//      根本不存在的码。
+//   2. 某个明确该在的码确实在。
+std::vector<std::wstring> SplitCodes(const std::wstring& comment) {
+  std::vector<std::wstring> out;
+  std::wstring current;
+  for (wchar_t ch : comment) {
+    if (ch == L' ') {
+      if (!current.empty()) out.push_back(current);
+      current.clear();
+    } else {
+      current.push_back(ch);
+    }
+  }
+  if (!current.empty()) out.push_back(current);
+  return out;
+}
+
+bool EveryCodeStartsWith(const std::wstring& comment, const wchar_t* prefix) {
+  const std::wstring want(prefix);
+  bool saw_one = false;
+  for (const std::wstring& code : SplitCodes(comment)) {
+    if (code == L"\u2026") continue;  // 截断省略号不是码
+    saw_one = true;
+    if (code.size() < want.size()) return false;
+    if (code.compare(0, want.size(), want) != 0) return false;
+  }
+  return saw_one;
+}
+
+bool Mentions(const std::wstring& comment, const wchar_t* code) {
+  for (const std::wstring& one : SplitCodes(comment)) {
+    if (one == code) return true;
+  }
+  return false;
+}
+
+bool Offers(zuxia::RimeEngine* engine, const char* keys,
+            const wchar_t* want_text) {
+  return CommentOf(engine, keys, want_text) != L"(not found)";
+}
+
+// 词表里没有的组合靠 enable_sentence 逐字拼。断言「出了个两字候选」而不是
+// 某个具体的词：拼出来是哪两个字由字频决定，会随词表变。
+bool OffersLength(zuxia::RimeEngine* engine, const char* keys, size_t len) {
+  engine->Clear();
+  zuxia::EngineSnapshot snapshot;
+  for (const char* p = keys; *p; ++p) {
+    snapshot = engine->ProcessKey(static_cast<int>(*p), 0);
+  }
+  for (const zuxia::Candidate& candidate : snapshot.candidates) {
+    if (candidate.text.size() == len) return true;
+  }
+  return false;
+}
+
+// 解码器交出来的候选不经过 AnnotateCode，注释是空的 —— 所以不能像 Offers()
+// 那样借「注释找不找得到」判断在不在，直接按候选文本找。
+bool OffersText(zuxia::RimeEngine* engine, const char* keys,
+                const wchar_t* want_text) {
+  engine->Clear();
+  zuxia::EngineSnapshot snapshot;
+  for (const char* p = keys; *p; ++p) {
+    snapshot = engine->ProcessKey(static_cast<int>(*p), 0);
+  }
+  for (const zuxia::Candidate& candidate : snapshot.candidates) {
+    if (candidate.text == want_text) return true;
+  }
+  return false;
+}
+
+}  // namespace
+
+int main() {
+  SetConsoleOutputCP(CP_UTF8);
+  zuxia::RimeEngine engine;
+  printf("initializing (first run compiles dictionaries)...\n");
+  fflush(stdout);
+  if (!engine.Initialize(nullptr)) {
+    printf("FAILED: engine did not initialize\n");
+    return 1;
+  }
+  printf("ready\n\n");
+
+  printf("candidates with their complete code:\n");
+  Case(&engine, "qing", 5);
+  Case(&engine, "qingz", 5);
+  Case(&engine, "qingzs", 5);
+  Case(&engine, "qingzq", 5);
+  Case(&engine, "qingzsq", 5);
+  Case(&engine, "zi", 5);
+  Case(&engine, "zisbz", 5);
+  Case(&engine, "hang", 5);
+  Case(&engine, "xing", 5);
+  Case(&engine, "tiandi", 5);
+  Case(&engine, "tiandidz", 5);
+  Case(&engine, "tiandidzyt", 5);
+
+  printf("\nchecks:\n");
+  // 清 = 氵(水 s) + 青(q, 另有别名 月 y), 左右 structure (z)。满码是
+  // qing + z + 任意两个部件字母，顺序不限。
+  Expect("清 under `qingzs` only promises codes starting with qingzs",
+         EveryCodeStartsWith(CommentOf(&engine, "qingzs", L"清"), L"qingzs"));
+  Expect("清 under `qingzs` still offers qingzsq",
+         Mentions(CommentOf(&engine, "qingzs", L"清"), L"qingzsq"));
+  Expect("清 under `qingzq` only promises codes starting with qingzq",
+         EveryCodeStartsWith(CommentOf(&engine, "qingzq", L"清"), L"qingzq"));
+  Expect("清 under `qingzq` still offers qingzqs",
+         Mentions(CommentOf(&engine, "qingzq", L"清"), L"qingzqs"));
+  Expect("清 under bare `qing` only promises codes starting with qing",
+         EveryCodeStartsWith(CommentOf(&engine, "qing", L"清"), L"qing"));
+  // The structure key alone already narrows things down.
+  Expect("清 survives the structure key `qingz`",
+         EveryCodeStartsWith(CommentOf(&engine, "qingz", L"清"), L"qingz"));
+  // 字 = 宀(宝盖 b) + 子(z), 上下 structure (s).
+  Expect("字 under `zisb` is annotated zisbz alone",
+         CommentOf(&engine, "zisb", L"字") == L"zisbz");
+  // 行 has three readings; only the one being typed should show, and each
+  // reading carries three complete codes (any two of 彳/一/亍 in either
+  // order) -- which is exactly why the annotation is capped.
+  Expect("行 under `hang` shows only its hang codes",
+         EveryCodeStartsWith(CommentOf(&engine, "hang", L"行"), L"hang"));
+  Expect("行 under `xing` shows only its xing codes",
+         EveryCodeStartsWith(CommentOf(&engine, "xing", L"行"), L"xing"));
+
+  // 词组：全拼 -> 加逐位结构串 -> 加逐位部件串。天 独体(d) 一(y),
+  // 地 左右(z) 土(t)。三档都要能打出来 —— 0.2.0 装出来时一档都打不出，
+  // 因为词组码表根本没生成。
+  printf("\nphrases:\n");
+  Expect("天地 under bare pinyin `tiandi`", Offers(&engine, "tiandi", L"天地"));
+  Expect("天地 under `tiandidz` (structure column)",
+         Offers(&engine, "tiandidz", L"天地"));
+  Expect("天地 under `tiandidzyt` (component column)",
+         Offers(&engine, "tiandidzyt", L"天地"));
+  Expect("星辰 under bare pinyin `xingchen`", Offers(&engine, "xingchen", L"星辰"));
+  Expect("星辰 under `xingchensbrc` (full columnar code)",
+         Offers(&engine, "xingchensbrc", L"星辰"));
+  // 银枪 rime-ice 的 12 万词里没有。全拼那一档要有东西出来。
+  Expect("词表外的 `yinqiang` 仍拼得出一个两字候选",
+         OffersLength(&engine, "yinqiang", 2));
+
+  // 列式解码器：词表外的词把三档码打满也要能出。它现在是补位 —— Rime 的
+  // 候选排在前面，解码器填这一页剩下的空位，所以这两条同时验了解码本身和
+  // RimeEngine 里那段接线；用例与 tools/linux-selftest 的断言一致。
+  printf("\ncolumnar decoder (out-of-dictionary):\n");
+  Expect("平戎策 under `pingrongcedbsggz` (全拼+结构+部件)",
+         OffersText(&engine, "pingrongcedbsggz", L"平戎策"));
+  Expect("银枪 under `yinqiangzzjm` (全拼+结构+部件)",
+         OffersText(&engine, "yinqiangzzjm", L"银枪"));
+
+  // 补位。解码器原先只在 Rime 交白卷时才上场，那个门槛定错了：打
+  // rongma，Rime 靠补全凑出「容貌」「绒毛」，于是解码器闭嘴 —— 而它把
+  // 「戎马」排在第一。这一段钉住改好之后的三条约定：Rime 的候选
+  // 原位不动，解码器只填后面的空位，按序号选中的是那个序号上的候选而不是
+  // 差一位的另一个。最后一条是这次改动唯一真正危险的地方。
+  printf("\nDecoder fills the rest of the page:\n");
+  Expect("戎马 is offered although Rime already answered",
+         OffersText(&engine, "rongma", L"戎马"));
+
+  engine.Clear();
+  zuxia::EngineSnapshot mixed;
+  for (const char* p = "rongma"; *p; ++p) {
+    mixed = engine.ProcessKey(static_cast<int>(*p), 0);
+  }
+  Expect("the page does not overflow", mixed.candidates.size() <= 9);
+  Expect("Rime keeps the first slot",
+         !mixed.candidates.empty() && mixed.candidates[0].text != L"戎马");
+  if (mixed.candidates.size() >= 2) {
+    const size_t last = mixed.candidates.size() - 1;
+    const std::wstring want = mixed.candidates[last].text;
+    printf("  picking #%zu: ", last + 1);
+    Print(want);
+    printf("\n");
+    const zuxia::EngineSnapshot picked =
+        engine.ProcessKey(static_cast<int>('1' + last), 0);
+    Expect("a number key commits the candidate carrying that number",
+           picked.commit == want);
+  }
+  engine.Clear();
+
+  // 死码兜底。列式码是定长的，打到一半或者打错一位，整串码就谁也拼不出
+  // 来，解码器原先在这种时候一声不吭 —— 而这正是最该帮一把的时候。现在
+  // 它退到最长有效前缀，并且把没用上的那几位原样交回 Rime 接着组字。
+  // 第二条断言是这段改动的全部风险所在：交不回去就等于吃掉用户按过的键。
+  printf("\nDead code falls back to the longest valid prefix:\n");
+  engine.Clear();
+  zuxia::EngineSnapshot dead;
+  for (const char* p = "zuxiasdkq"; *p; ++p) {
+    dead = engine.ProcessKey(static_cast<int>(*p), 0);
+  }
+  // Rime 的 speller 会挡掉它不认的键，所以先看清它到底收下了几个。
+  const std::string raw_before = engine.RawInput();
+  printf("  Rime took: %s\n", raw_before.c_str());
+  size_t fallback_at = dead.candidates.size();
+  for (size_t i = 0; i < dead.candidates.size(); ++i) {
+    if (dead.candidates[i].text == L"足下") {
+      fallback_at = i;
+      break;
+    }
+  }
+  Expect("足下 is still offered for zuxiasdkq (prefix zuxiasdk)",
+         fallback_at < dead.candidates.size() && fallback_at < 9);
+  if (fallback_at < dead.candidates.size() && fallback_at < 9) {
+    const zuxia::EngineSnapshot picked =
+        engine.ProcessKey(static_cast<int>('1' + fallback_at), 0);
+    Expect("picking it commits the prefix word", picked.commit == L"足下");
+    if (raw_before == "zuxiasdkq") {
+      // 全部九个键都进去了，那没用上的 q 必须回到组字里。
+      Expect("the unused tail keeps composing instead of vanishing",
+             !picked.preedit.empty() && engine.RawInput() == "q");
+      printf("  tail left composing: ");
+      Print(picked.preedit);
+      printf("\n");
+    } else {
+      // Rime 自己就没收那个键，也就没有键可丢。
+      Expect("Rime filtered the tail itself, so nothing was lost",
+             engine.RawInput().empty());
+    }
+  }
+  engine.Clear();
+
+  // 组字中的控制键。0.2.0 的回车走 librime 的 express_editor，把原始码串
+  // 当文本落进文档（微软拼音、搜狗都是这个行为）—— 真机上这正是「词打到
+  // 一半按回车，部件码落进聊天框」的根因。0.3.0 起在 express_editor
+  // 之前拦下回车：放弃这次组字，什么都不落；打英文走中/西切换。Esc 的行
+  // 为没动，本来就是只清组字。两者都被吃掉，所以组字期间换行和 Esc 到不
+  // 了应用，这是行为取舍，不是缺陷，但必须有断言看着。
+  printf("\nControl keys while composing (pinned, not fixed):\n");
+  engine.Clear();
+  for (const char* p = "xingchen"; *p; ++p) engine.ProcessKey(static_cast<int>(*p), 0);
+  const std::string raw_for_return = engine.RawInput();
+  const zuxia::EngineSnapshot on_return = engine.ProcessKey(0xff0d, 0);  // XK_Return
+  Expect("Return while composing is handled by the engine", on_return.handled);
+  Expect("Return had something to discard", !raw_for_return.empty());
+  Expect("Return commits nothing (0.3.0: the composition is discarded)",
+         on_return.commit.empty());
+  Expect("nothing is left composing after Return", !on_return.composing);
+  Expect("Return clears the raw input too", engine.RawInput().empty());
+  engine.Clear();
+
+  for (const char* p = "xingchen"; *p; ++p) engine.ProcessKey(static_cast<int>(*p), 0);
+  const zuxia::EngineSnapshot on_escape = engine.ProcessKey(0xff1b, 0);  // XK_Escape
+  Expect("Escape while composing is handled by the engine", on_escape.handled);
+  Expect("Escape commits nothing", on_escape.commit.empty());
+  Expect("Escape leaves nothing composing", !on_escape.composing);
+  engine.Clear();
+
+  // 小键盘的选字键。VirtualKeyToRimeKey 要把 VK_NUMPAD0..9 映成 '0'..'9'，
+  // 不然小键盘按 3 会把「3」原样插进文档，还把已经打进去的码顶掉。
+  printf("\nNumpad digits map to selection keys:\n");
+  bool numpad_ok = true;
+  for (int i = 0; i <= 9; ++i) {
+    if (zuxia::RimeEngine::VirtualKeyToRimeKey(VK_NUMPAD0 + i) != '0' + i) {
+      numpad_ok = false;
+    }
+  }
+  Expect("VK_NUMPAD0..9 map to '0'..'9'", numpad_ok);
+
+  // 这一段防的是一个真发生过的回归：日志每行都从文件第 0 字节写起，互相
+  // 覆盖，文件长度只等于最长那一行，内容是好几行的碎片 —— 看上去还像份
+  // 日志，于是排查真机故障时全靠它，而它在骗人。
+  printf("\nDiagnostic log:\n");
+  const std::wstring log_path = zuxia::LogPath();
+  Expect("log path resolves", !log_path.empty());
+  if (!log_path.empty()) {
+    const long long before = FileSize(log_path);
+    zuxia::LogEvent(L"selftest", L"append check 1");
+    const long long middle = FileSize(log_path);
+    zuxia::LogEvent(L"selftest", L"append check 2");
+    const long long after = FileSize(log_path);
+    Expect("an event makes the log grow", middle > before);
+    Expect("the next event appends rather than overwrites", after > middle);
+  }
+
+  // 回流的端到端检查：从解码候选里选一个，下一次打同一串码它就该排第一。
+  // 记下来的那张表在用户目录下，所以这一段会真的写盘 —— 在 CI 上无所谓，
+  // 在自己机器上跑就等于教了它一条，删掉 zuxia.decoder.user.tsv 即可。
+  printf("\nRecall from decoder picks:\n");
+  const char* kRecallCode = "yinqiangzzjm";
+  engine.Clear();
+  zuxia::EngineSnapshot typed;
+  for (const char* p = kRecallCode; *p; ++p) {
+    typed = engine.ProcessKey(static_cast<int>(*p), 0);
+  }
+  Expect("the decoder offers at least three candidates",
+         typed.candidates.size() >= 3);
+  if (typed.candidates.size() >= 3) {
+    const std::wstring third = typed.candidates[2].text;
+    printf("  picking #3: ");
+    Print(third);
+    printf("\n");
+    const zuxia::EngineSnapshot picked = engine.ProcessKey('3', 0);
+    Expect("picking the third candidate commits it", picked.commit == third);
+
+    engine.Clear();
+    zuxia::EngineSnapshot again;
+    for (const char* p = kRecallCode; *p; ++p) {
+      again = engine.ProcessKey(static_cast<int>(*p), 0);
+    }
+    Expect("the pick leads the list next time",
+           !again.candidates.empty() && again.candidates[0].text == third);
+    Expect("the searched candidates are still offered",
+           again.candidates.size() >= 3);
+    engine.Clear();
+  }
+
+  // 触发码（0.4.2）：dt 出日期时间，nl 出农历，后面可以跟一个冒号。两个
+  // Lua 脚本在 data\lua\ 下，由 rime.dll 自带的 librime-lua 加载；这一段
+  // 同时验了「脚本装进去了」「方案里的 recognizer / matcher 接对了」「冒号
+  // 进了组字串而不是被当成标点落下」。
+  printf("\nTrigger codes dt (date and time) and nl (lunar date):\n");
+  const char* triggers[] = {"dt", "dt:", "nl", "nl:"};
+  for (const char* keys : triggers) {
+    const zuxia::EngineSnapshot got = Type(&engine, keys);
+    printf("  %-5s -> ", keys);
+    Print(Joined(got, 9));
+    printf("\n");
+    Notice(keys, got);
+    const bool lunar = keys[0] == 'n';
+    char label[96] = {};
+    sprintf_s(label, "%s offers candidates", keys);
+    Expect(label, got.candidates.size() >= 7);
+    sprintf_s(label, "%s commits nothing while typing", keys);
+    Expect(label, got.commit.empty() && got.composing);
+    sprintf_s(label, "%s keeps every key it was given", keys);
+    Expect(label, engine.RawInput() == keys);
+    if (got.candidates.empty()) continue;
+    const std::wstring& first = got.candidates[0].text;
+    if (lunar) {
+      sprintf_s(label, "%s first candidate is a lunar month and day", keys);
+      Expect(label, Contains(first, L"\u6708") &&  // 月
+                        first.find_first_of(L"0123456789") == std::wstring::npos);
+      bool says_lunar = false;
+      for (const zuxia::Candidate& c : got.candidates) {
+        if (Contains(c.text, L"\u519c\u5386")) says_lunar = true;  // 农历
+      }
+      sprintf_s(label, "%s offers a candidate starting with nongli", keys);
+      Expect(label, says_lunar);
+    } else {
+      sprintf_s(label, "%s first candidate is year-month-day", keys);
+      Expect(label, Contains(first, L"\u5e74") && Contains(first, L"\u6708") &&
+                        Contains(first, L"\u65e5"));  // 年 月 日
+    }
+  }
+  {
+    const zuxia::EngineSnapshot typed = Type(&engine, "dt");
+    if (!typed.candidates.empty()) {
+      const zuxia::EngineSnapshot picked = engine.ProcessKey('1', 0);
+      Expect("dt then 1 commits the date", picked.commit == typed.candidates[0].text);
+      Expect("and nothing is left composing", !picked.composing);
+    }
+    engine.Clear();
+  }
+  // 码表里没有以 dt / nl 开头的码；触发码只认整串，打到一半的码里出现
+  // 这两个字母不受影响。
+  {
+    const zuxia::EngineSnapshot date = Type(&engine, "dt");
+    const std::wstring today =
+        date.candidates.empty() ? std::wstring() : date.candidates[0].text;
+    const zuxia::EngineSnapshot longer = Type(&engine, "dtx");
+    bool leaked = false;
+    for (const zuxia::Candidate& c : longer.candidates) {
+      if (!today.empty() && c.text == today) leaked = true;
+    }
+    Expect("dtx is not a trigger (no date candidate)", !leaked);
+    engine.Clear();
+  }
+
+  // 整字作部件（0.4.2）：月 是独体字，没有可拆的部件，它自己当部件，部件码
+  // 取它的读音首字母 y。明月 = 明(左右 z) 月(独体 d)，部件串 r(日) y(月)。
+  // 0.4.1 打 mingyuezdry 出不来明月。
+  //
+  // 词组码表只收每个字的第一个部件（月 的是 冂 j），所以 mingyuezd 和
+  // mingyuezdrj 在表里，Rime 的首选本来就对；mingyuezdry 不在表里，Rime 给
+  // 不出东西，由解码器带头。最后一条 zhongshushuzzd 词库里也没有，Rime 连打
+  // 成句凑出来的句子末字是左右结构的 殊，不合列，同样由解码器带头。
+  printf("\nWhole character as its own component, and the decoder leading:\n");
+  struct Lead {
+    const char* keys;
+    const wchar_t* want;
+    const char* name;
+  };
+  const Lead leads[] = {
+      {"mingyuezd", L"\u660e\u6708", "mingyue"},                 // 明月
+      {"mingyuezdry", L"\u660e\u6708", "mingyue"},               // 明月
+      {"mingyuezdrj", L"\u660e\u6708", "mingyue"},               // 明月
+      {"zhongshushuzzd", L"\u79cd\u6811\u4e66", "zhongshushu"},  // 种树书
+  };
+  for (const Lead& lead : leads) {
+    const zuxia::EngineSnapshot got = Type(&engine, lead.keys);
+    printf("  %-14s -> ", lead.keys);
+    Print(Joined(got, 9));
+    printf("\n");
+    Notice(lead.keys, got);
+    char label[96] = {};
+    sprintf_s(label, "%s puts %s first", lead.keys, lead.name);
+    Expect(label, !got.candidates.empty() && got.candidates[0].text == lead.want);
+  }
+  engine.Clear();
+
+  // 解码器带头时整页是重排过的：数字键、上下键加空格、标点，落下的都必须
+  // 是看得见的那一条。每个位置都按一遍（每次重新打码，回流会改顺序，所以
+  // 跟当次的快照比）。
+  printf("\nSelecting on a page the decoder leads:\n");
+  {
+    const zuxia::EngineSnapshot first = Type(&engine, "mingyuezdry");
+    const size_t count = first.candidates.size() < 9 ? first.candidates.size() : 9;
+    bool all_match = count > 0;
+    for (size_t i = 0; i < count; ++i) {
+      const zuxia::EngineSnapshot page = Type(&engine, "mingyuezdry");
+      if (i >= page.candidates.size()) break;
+      const std::wstring want = page.candidates[i].text;
+      const zuxia::EngineSnapshot picked =
+          engine.ProcessKey(static_cast<int>('1' + i), 0);
+      if (!TookCandidate(picked, want)) {
+        all_match = false;
+        printf("  #%zu wanted ", i + 1);
+        Print(want);
+        printf(", committed ");
+        Print(picked.commit.empty() ? std::wstring(L"(nothing)") : picked.commit);
+        printf(", composing ");
+        Print(picked.preedit.empty() ? std::wstring(L"(nothing)") : picked.preedit);
+        printf("\n");
+      }
+    }
+    Expect("every number key commits the candidate it labels", all_match);
+
+    const zuxia::EngineSnapshot page = Type(&engine, "mingyuezdry");
+    if (page.candidates.size() >= 2) {
+      const zuxia::EngineSnapshot moved = engine.ProcessKey(0xff54, 0);  // XK_Down
+      Expect("Down moves the highlight to the second candidate",
+             moved.highlighted == 1);
+      const zuxia::EngineSnapshot spaced = engine.ProcessKey(' ', 0);
+      Expect("Space then takes the second candidate",
+             TookCandidate(spaced, page.candidates[1].text));
+    }
+    const zuxia::EngineSnapshot again = Type(&engine, "mingyuezdry");
+    if (!again.candidates.empty()) {
+      const zuxia::EngineSnapshot comma = engine.ProcessKey(',', 0);
+      Expect("a comma commits the highlighted candidate, then the comma",
+             comma.commit == again.candidates[0].text + L"\uff0c");  // ，
+    }
+    engine.Clear();
+  }
+
+  // Chinese text wants Chinese marks. The engine is handed the plain ASCII
+  // character; librime's punctuator is what turns it into the full-width form.
+  printf("\nChinese punctuation:\n");
+  struct Mark {
+    char key;
+    const wchar_t* want;
+    const char* name;
+  };
+  const Mark marks[] = {
+      {',', L"，", "comma"},     {'.', L"。", "full stop"},
+      {'?', L"？", "question"},  {'!', L"！", "exclamation"},
+      {';', L"；", "semicolon"}, {':', L"：", "colon"},
+      {'\\', L"、", "enumeration comma"},
+  };
+  for (const Mark& mark : marks) {
+    engine.Clear();
+    const zuxia::EngineSnapshot snapshot =
+        engine.ProcessKey(static_cast<int>(mark.key), 0);
+    char label[72] = {};
+    sprintf_s(label, "%s becomes its Chinese form", mark.name);
+    Expect(label, snapshot.commit == mark.want);
+  }
+
+  // Shift＋数字。中文的 ！（） 三个标点都在数字键上，得按住 Shift 才出得
+  // 来。VirtualKeyToRimeKey 原先对数字键无条件返回数字，于是想打「（」得到
+  // 的是「9」—— 组字中那一下还会被当成选第 9 个候选。这一段用
+  // SetKeyboardState 模拟按住 Shift，再看送到引擎的到底是什么。
+  printf("\nShift+digit is punctuation, not a digit:\n");
+  {
+    BYTE saved[256] = {};
+    if (GetKeyboardState(saved)) {
+      BYTE shifted[256] = {};
+      memcpy(shifted, saved, sizeof(shifted));
+      shifted[VK_SHIFT] = 0x80;
+      shifted[VK_LSHIFT] = 0x80;
+      SetKeyboardState(shifted);
+      const bool punct = zuxia::RimeEngine::IsPunctuationKey('9');
+      const int nine = zuxia::RimeEngine::VirtualKeyToRimeKey('9');
+      const int one = zuxia::RimeEngine::VirtualKeyToRimeKey('1');
+      SetKeyboardState(saved);
+      // punct 为真就说明模拟的 Shift 真起了作用（数字键打出了非数字），
+      // 这一步与被测的改动无关，所以拿它当闸门是可靠的。
+      if (!punct) {
+        printf("  (simulated Shift had no effect here; skipped)\n");
+      } else {
+        printf("  Shift+9 -> %d '%c', Shift+1 -> %d '%c'\n", nine,
+               nine ? nine : '?', one, one ? one : '?');
+        Expect("Shift+9 reaches the engine as '(' not '9'", nine == '(');
+        Expect("Shift+1 reaches the engine as '!' not '1'", one == '!');
+        engine.Clear();
+        const zuxia::EngineSnapshot bracket = engine.ProcessKey(nine, 0);
+        Expect("and comes out as （", bracket.commit == L"（");
+        engine.Clear();
+      }
+      Expect("a bare 9 is still the digit 9",
+             zuxia::RimeEngine::VirtualKeyToRimeKey('9') == '9');
+    } else {
+      printf("  (keyboard state unavailable; skipped)\n");
+    }
+  }
+
+  printf("\nWestern-mode toggle:\n");
+  engine.Clear();
+  Expect("starts in Chinese mode", !engine.IsAsciiMode());
+  Expect("toggle turns Western mode on", engine.ToggleAsciiMode());
+  Expect("IsAsciiMode agrees", engine.IsAsciiMode());
+  Expect("toggle turns it back off", !engine.ToggleAsciiMode());
+  Expect("back in Chinese mode", !engine.IsAsciiMode());
+  engine.Clear();
+  Expect("Chinese mode still produces candidates",
+         !CommentOf(&engine, "qingzs", L"清").empty());
+
+  printf("\n%s (%d checks, %d failure%s)\n",
+         failures ? "FAILED" : "ALL CHECKS PASSED", checks, failures,
+         failures == 1 ? "" : "s");
+  printf("::notice title=engine-test::%d checks, %d failures\n", checks, failures);
+  return failures ? 1 : 0;
+}
