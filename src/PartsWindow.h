@@ -76,7 +76,9 @@ class CPartsWindow {
   struct Cell {
     RECT box = {};
     std::wstring glyph;
-    bool small = false;  // 繁体对照的小格
+    // 繁体对照的小格。不能叫 small：Windows SDK 的 rpcndr.h 里
+    // #define small char。
+    bool is_small = false;
   };
   struct Layout {
     bool vertical = true;

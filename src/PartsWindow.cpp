@@ -741,7 +741,7 @@ void CPartsWindow::BuildLayout(double scale, bool vertical, Layout* out) {
         const int left = sx + k * (sgrid + gap);
         trad.box = {left, sy, left + sgrid, sy + sgrid};
         trad.glyph = one.traditional[static_cast<size_t>(k)];
-        trad.small = true;
+        trad.is_small = true;
         lay.cells.push_back(std::move(trad));
       }
       Line label;
@@ -1120,7 +1120,7 @@ void CPartsWindow::Paint(HDC dc) {
   SetTextColor(dc, GetSysColor(COLOR_WINDOWTEXT));
   for (const Cell& cell : layout_.cells) {
     DrawMiziGrid(dc, cell.box);
-    SelectObject(dc, cell.small ? small_font_ : big_font_);
+    SelectObject(dc, cell.is_small ? small_font_ : big_font_);
     RECT box = cell.box;
     DrawTextW(dc, cell.glyph.c_str(), static_cast<int>(cell.glyph.size()), &box,
               DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
